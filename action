@@ -1,0 +1,201 @@
+#!/usr/bin/perl
+
+use CGI qw/ header /;
+use CGI::Carp qw/ fatalsToBrowser /;
+use CGI::Fast;
+use CGI::Session qw/ -ip-match /;
+use Config::Simple qw/ -lc /;
+use Cwd qw/ abs_path /;
+use DBD::SQLite;
+use DBI;
+use Encode qw/ decode_utf8 /;
+use English qw/ $PROGRAM_NAME /;
+use File::Basename qw/ dirname /;
+use File::Spec::Functions qw/ catfile /;
+use File::stat;
+use HTML::Template;
+use feature qw/ state /;
+use open qw/ :utf8 :std /;
+use utf8;
+use strict;
+use constant SALTMAX => 64;
+use constant PRIMITIVES => join( '', 0 .. 9, 'a' .. 'z', 'A' .. 'Z' );
+
+our $DBH;
+&main();
+
+sub main {
+    state $mtime = stat($PROGRAM_NAME)->mtime;
+    $DBH = &opendb( &param_dbfile() );
+    while( my $cgi = CGI::Fast->new ){
+	exit if stat($PROGRAM_NAME)->mtime > $mtime;
+	if( $cgi->path_info =~ m!/status\Z! ){
+	    print &header( -status => 200, -type => 'text/plain' ), "OK";
+	} elsif( my( $action, $key ) = ( $cgi->path_info =~ m!/(go|view)/([0-9a-zA-Z]+)\Z! ) ){
+	    no strict 'refs';
+	    &{$action}( $cgi, $key );
+	} elsif( $cgi->path_info =~ m!/create\Z! ){
+	    &create( $cgi );
+	} else {
+	    print &header( -status => 404, -type => 'text/plain' ), "No valid action.";
+	}
+    }
+}
+
+sub go {
+    my( $cgi, $key ) = @_;
+    my $num = &decode_base62($key);
+    my $id = int( $num / SALTMAX );
+    my $salt = $num % SALTMAX;
+    $DBH->prepare( sprintf( q/select url from urls where id=%d and salt=%d;/, $id, $salt ) );
+    my $sth = $DBH->execute();
+    if( my( $url ) = $sth->fetchrow_array() ){
+	print &header( -status => 302, -location => $url );
+    } else {
+	print &header( -status => 404, -type => 'text/plain' ), "Invalid key.";
+    }
+}
+
+sub view {
+    my( $cgi, $key ) = @_;
+    my $num = &decode_base62($key);
+    my $id = int( $num / SALTMAX );
+    my $salt = $num % SALTMAX;
+    $DBH->prepare( sprintf( q/select url,creator,ctime from urls where id=%d and salt=%d;/, $id, $salt ) );
+    my $sth = $DBH->execute();
+    if( my( $url, $creator, $ctime ) = $sth->fetchrow_array() ){
+	my $template = &open_template( filename => 'view.tmpl' );
+	$template->param( id => $id,
+			  shorturl => sprintf('%s/%s', $cgi->url, $key),
+			  longurl => $url,
+			  creator => $creator,
+			  ctime => $ctime );
+	print &header( -status => 200, -type => 'text/plain', -charset => 'UTF-8' ), $template->output;
+    } else {
+	print &header( -status => 404, -type => 'text/plain' ), "Invalid key.";
+    }
+}
+
+sub create {
+    my( $cgi ) = @_;
+    my $creator = $ENV{&param_loginvarname};
+    my $url = $cgi->param('url');
+    $DBH->do( sprintf( <<'__insert_url__', $creator, $url, int(rand(SALTMAX)), $ENV{&param_ipaddrvarname} ) );
+insert or ignore into urls(('id','creator','url','salt','ipaddr') values('%s','%s',%d,'%s');
+__insert_url__
+    $DBH->prepare( sprintf( q/select id,salt,url,creator,ctime from urls where creator='%s' and url='%s';/,
+			    $creator, $url ) );
+    my $sth = $DBH->execute();
+    if( my( $id, $salt, $url, $creator, $ctime ) = $sth->fetchrow_array() ){
+	my $num = $id * SALTMAX + $salt;
+	my $template = &open_template( filename => 'view.tmpl' );
+	$template->param( id => $id,
+			  shorturl => sprintf('%s/%s', $cgi->url, &encode_base62( $id * SALTMAX + $salt ) ),
+			  longurl => $url,
+			  creator => $creator,
+			  ctime => $ctime );
+	print &header( -status => 200, -type => 'text/plain', -charset => 'UTF-8' ), $template->output;
+    } else {
+	print &header( -status => 404, -type => 'text/plain' ), "Invalid key.";
+    }
+}
+
+sub opendb {
+    my( $dbfile ) = @_;
+    my $dbh = DBI->connect( sprintf( 'dbi:SQLite:dbname=%s', $dbfile ), '', '' );
+    $dbh->do( <<'__pragma__' );
+PRAGMA foreign_keys=ON;
+__pragma__
+    $dbh->do( <<'__create_urls_table__' );
+CREATE TABLE if not exists urls (
+	id INTEGER PRIMARY KEY,
+	salt INTEGER UNSIGNED NOT NULL,
+	url TEXT NOT NULL,
+	creator TEXT NOT NULL,
+	ctime TIMESTAMP DEFAULT (datetime(CURRENT_TIMESTAMP)),
+	ipaddr TEXT NOT NULL,
+	UNIQUE(creator, url)
+);
+__create_urls_table__
+    $dbh->do( <<'__create_logs_table__' );
+CREATE TABLE if not exists logs (
+	id INTEGER,
+	ipaddr TEXT NOT NULL,
+	atime TIMESTAMP DEFAULT (datetime(CURRENT_TIMESTAMP)),
+	PRIMARY KEY (id, ipaddr, atime),
+	FOREIGN KEY (id) REFERENCES urls(id)
+);
+__create_logs_table__
+    $dbh;
+}
+
+sub open_template {
+    my( %option ) = @_;
+    push( @_, filter => \&utf8_template_filter ) unless $option{filter};
+    push( @_, default_escape => 'HTML' ) unless $option{default_escape};
+    push( @_, die_on_bad_params => 0 ) unless $option{die_on_bad_params};
+    unless( $option{path} ){
+	my $curdir = &dirname( &abs_path( $ENV{SCRIPT_FILENAME} || $PROGRAM_NAME ) );
+	push( @_, path => [$curdir] );
+    }
+    HTML::Template->new( @_ );
+}
+
+sub utf8_template_filter {
+    my $ref = shift;
+    $$ref = &decode_utf8( $$ref );
+}
+
+sub encode_base62 {
+    my( $num ) = @_;
+    my @ch;
+    do {
+	push( @ch, substr( PRIMITIVES, $num % length(PRIMITIVES), 1 ) );
+	$num = int( $num / length(PRIMITIVES) );
+    } while( $num );
+    join( '', reverse @ch );
+}
+
+sub decode_base62 {
+    my( $str ) = @_;
+    my $num = 0;
+    my( @ch ) = reverse( split( //, $str ) );
+    for( my $i = 0; $ch[$i]; $i++ ){
+	my $place = length(PRIMITIVES) ** $i;
+	$num += index(PRIMITIVES, $ch[$i]) * $place;
+    }
+    $num;
+}
+
+sub param_dbfile {
+    'test.sqlite3';
+}
+
+sub param_loginvarname {
+    'REMOTE_USER';
+}
+
+sub param_ipaddrvarname {
+    'REMOTE_ADDR';
+}
+
+=head1 AUTHOR
+
+TSUCHIYA Masatoshi <tsuchm@gmail.com>
+
+=head1 COPYRIGHT
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=cut
