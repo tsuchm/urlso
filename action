@@ -100,6 +100,15 @@ __insert_url__
     }
 }
 
+sub remove {
+}
+
+sub admin {
+}
+
+sub login {
+}
+
 sub opendb {
     my( $dbfile ) = @_;
     my $dbh = DBI->connect( sprintf( 'dbi:SQLite:dbname=%s', $dbfile ), '', '' );
@@ -111,6 +120,7 @@ CREATE TABLE if not exists urls (
 	id INTEGER PRIMARY KEY,
 	salt INTEGER UNSIGNED NOT NULL,
 	url TEXT NOT NULL,
+	public BOOLEAN,
 	creator TEXT NOT NULL,
 	ctime TIMESTAMP DEFAULT (datetime(CURRENT_TIMESTAMP)),
 	ipaddr TEXT NOT NULL,
@@ -159,10 +169,10 @@ sub encode_base62 {
 sub decode_base62 {
     my( $str ) = @_;
     my $num = 0;
-    my( @ch ) = reverse( split( //, $str ) );
-    for( my $i = 0; $ch[$i]; $i++ ){
-	my $place = length(PRIMITIVES) ** $i;
-	$num += index(PRIMITIVES, $ch[$i]) * $place;
+    my $place = 1;
+    for my $c ( reverse split( //, $str ) ){
+	$num += index(PRIMITIVES, $c) * $place;
+	$place *= length(PRIMITIVES);
     }
     $num;
 }
